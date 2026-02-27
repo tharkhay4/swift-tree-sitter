@@ -20,20 +20,35 @@ extension QueryPredicateStep: CustomStringConvertible {
     }
 }
 
-public enum Predicate: Hashable {
+public enum Predicate: Hashable, Sendable {
     case eq([String], captureNames: [String])
+    case notEq([String], captureNames: [String])
     case match(NSRegularExpression, captureNames: [String])
+    case notMatch(NSRegularExpression, captureNames: [String])
     case isNot(String)
+    case anyOf(Set<String>, captureName: String)
+    case notAnyOf(Set<String>, captureName: String)
+	case set(captureName: String? = nil, key: String, value: String)
     case generic(String, strings: [String], captureNames: [String])
 
     public var captureNames: [String] {
         switch self {
         case .eq(_, let names):
             return names
+        case .notEq(_, let names):
+            return names
         case .match(_, let names):
+            return names
+        case .notMatch(_, let names):
             return names
         case .isNot:
             return []
+        case .anyOf(_, let names):
+            return [names]
+        case .notAnyOf(_, let names):
+            return [names]
+		case .set:
+			return []
         case .generic(_, _, let names):
             return names
         }
@@ -48,6 +63,33 @@ public enum Predicate: Hashable {
             return names.contains(name)
         })
     }
+
+	public func evalulate(with text: String) -> Bool {
+		switch self {
+		case .eq(let strings, _):
+			return strings.allSatisfy({ $0 == text })
+		case .notEq(let strings, _):
+			return strings.allSatisfy({ $0 != text })
+		case .match(let exp, _):
+			let range = NSRange(0..<text.utf16.count)
+
+			return exp.firstMatch(in: text, range: range) != nil
+		case .notMatch(let exp, _):
+			let range = NSRange(0..<text.utf16.count)
+
+			return exp.firstMatch(in: text, range: range) == nil
+		case .anyOf(let set, _):
+			return set.contains(text)
+		case .notAnyOf(let set, _):
+			return set.contains(text) == false
+		case .isNot:
+			return false
+		case .set:
+			return true
+		case .generic:
+			return false
+		}
+	}
 }
 
 enum PredicateParserError: Error {
@@ -108,20 +150,48 @@ struct PredicateParser {
         switch name {
         case "eq?":
             return .eq(strings, captureNames: captures)
+        case "not-eq?":
+            return .notEq(strings, captureNames: captures)
         case "match?":
-            if strings.count != 1 {
+            guard let pattern = strings.first else {
                 return .generic(name, strings: strings, captureNames: captures)
             }
 
-            let expression = try NSRegularExpression(pattern: strings.first!, options: [])
+            let expression = try NSRegularExpression(pattern: pattern, options: [])
 
             return .match(expression, captureNames: captures)
+        case "not-match?":
+            guard let pattern = strings.first else {
+                return .generic(name, strings: strings, captureNames: captures)
+            }
+
+            let expression = try NSRegularExpression(pattern: pattern, options: [])
+
+            return .notMatch(expression, captureNames: captures)
+        case "any-of?":
+            guard let capture = captures.first else {
+                return .generic(name, strings: strings, captureNames: captures)
+            }
+
+            return .anyOf(Set(strings), captureName: capture)
+        case "not-any-of?":
+            guard let capture = captures.first else {
+                return .generic(name, strings: strings, captureNames: captures)
+            }
+
+            return .notAnyOf(Set(strings), captureName: capture)
         case "is-not?":
             if strings != ["local"] {
                 return .generic(name, strings: strings, captureNames: captures)
             }
 
             return .isNot(strings.first!)
+		case "set!":
+			if strings.count != 2 || captures.count > 1 {
+				return .generic(name, strings: strings, captureNames: captures)
+			}
+
+			return .set(captureName: captures.first, key: strings[0], value: strings[1])
         default:
             return .generic(name, strings: strings, captureNames: captures)
         }

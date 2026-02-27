@@ -1,19 +1,50 @@
 import Foundation
 
+/// An enhanced QueryCursor that can resolve predicates.
+///
+/// By default tree-sitter leaves the evaluation of predicates up
+/// to user libraries. `ResolvingQueryCursor` has a very similar API
+/// to the standard `QueryCursor`, but can also resolve predicates. This class
+/// also comes with some features that help to run queries in
+/// the background safely and efficiently.
+///
+/// The following predicates are parsed and transformed into structured
+/// `Predicate` cases. All others are turned into the `generic` case.
+///
+/// - `eq?`
+/// - `not-eq?`
+/// - `match?`
+/// - `not-match?`
+/// - `any-of?`
+/// - `not-any-of?`
+/// - `is-not?` (parsed, but not implemented)
+/// - `set!` (handled by `QueryCursor`)
+///
+/// Here's an example of how it is used:
+/// ```swift
+/// let resolvingCursor = ResolvingQueryCursor(cursor: queryCursor)
+///
+/// let provider: TextProvider = { range, pointRange in ... }
+///
+/// resolvingCursor.prepare(with: provider)
+///
+/// for match in resolvingCursor {
+///     print("match: ", match)
+/// }
+/// ```
 public final class ResolvingQueryCursor {
+	/// A function that can produce text content.
     public typealias TextProvider = (NSRange, Range<Point>) -> String?
 
     private var matches: [QueryMatch]
     private let cursor: QueryCursor
     private var index: Array.Index
-    private var textProvider: TextProvider
-    private var cachedText: [NSRange : String]
+    private(set) var textProvider: TextProvider
 
     public init(cursor: QueryCursor) {
         self.cursor = cursor
         self.matches = []
         self.index = matches.startIndex
-        self.cachedText = [:]
         self.textProvider = { _, _ in return nil }
     }
 
@@ -21,14 +52,14 @@ public final class ResolvingQueryCursor {
     ///
     /// Iterating over matches can be very expensive for certain
     /// queries/inputs. This is helpful if you want to gather all
-    /// matches in the background before evalucating them later on.
+    /// matches in the background before evaluating them later on.
     public func prefetchMatches() {
         guard matches.isEmpty else {
             assertionFailure("Should not prefetch more than once")
             return
         }
 
-        while let match = cursor.nextMatch() {
+        while let match = cursor.next() {
             matches.append(match)
         }
 
@@ -37,17 +68,18 @@ public final class ResolvingQueryCursor {
 
     public func prepare(with textProvider: @escaping TextProvider) {
         self.index = matches.startIndex
-        self.cachedText.removeAll()
+
+        var cachedText = [NSRange : String]()
 
         // create a caching provider
         self.textProvider = { (range, pointRange) in
-            if let value = self.cachedText[range] {
+            if let value = cachedText[range] {
                 return value
             }
 
             let value = textProvider(range, pointRange)
 
-            self.cachedText[range] = value
+            cachedText[range] = value
 
             return value
         }
@@ -67,7 +99,7 @@ extension ResolvingQueryCursor: Sequence, IteratorProtocol {
                 continue
             }
 
-            return match
+			return match
         }
 
         return nil
@@ -76,7 +108,7 @@ extension ResolvingQueryCursor: Sequence, IteratorProtocol {
     private func nextMatch() -> QueryMatch? {
         // use the cursor directly if we haven't prefetched
         if matches.isEmpty {
-            return cursor.nextMatch()
+            return cursor.next()
         }
 
         if index >= matches.endIndex {
@@ -98,42 +130,23 @@ extension ResolvingQueryCursor {
     }
 
     func evaluatePredicate(_ predicate: Predicate, match: QueryMatch, textProvider: TextProvider) -> Bool {
-        switch predicate {
-        case .eq(let strings, let names):
-            return evaluateTextPredicate(match: match, captureNames: names, textProvider: textProvider) { text in
-                return strings.allSatisfy({ $0 == text })
-            }
-        case .match(let exp, let names):
-            return evaluateTextPredicate(match: match, captureNames: names, textProvider: textProvider) { text in
-                let range = NSRange(0..<text.utf16.count)
+		for captureName in predicate.captureNames {
+			let captures = match.captures(named: captureName)
 
-                return exp.rangeOfFirstMatch(in: text, options: [], range: range).location != NSNotFound
-            }
-        case .isNot:
-            return true
-        case .generic:
-            return false
-        }
-    }
+			for capture in captures {
+				let range = capture.node.range
+				let pointRange = capture.node.pointRange
 
-    func evaluateTextPredicate(match: QueryMatch, captureNames: [String], textProvider: TextProvider, predicate: (String) -> Bool) -> Bool {
-        for captureName in captureNames {
-            let captures = match.captures(named: captureName)
+				guard let text = textProvider(range, pointRange) else {
+					return false
+				}
 
-            for capture in captures {
-                let range = capture.node.range
-                let pointRange = capture.node.pointRange
+				if predicate.evalulate(with: text) == false {
+					return false
+				}
+			}
+		}
 
-                guard let text = textProvider(range, pointRange) else {
-                    return false
-                }
-
-                if predicate(text) == false {
-                    return false
-                }
-            }
-        }
-
-        return true
+		return true
     }
 }

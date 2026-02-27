@@ -23,6 +23,15 @@ public class Parser {
 }
 
 extension Parser {
+	/// Access the parser's language
+	///
+	/// Setting a language via this property isn't possible because that operation is failable. Please use `setLanguage`.
+	public var language: Language? {
+		get {
+			return ts_parser_language(internalParser).map { Language(language: $0) }
+		}
+	}
+
     public func setLanguage(_ language: Language) throws {
         try setLanguage(language.tsLanguage)
     }
@@ -34,6 +43,48 @@ extension Parser {
             throw ParserError.languageFailure
         }
     }
+
+	/// The ranges this parser will operate on.
+	///
+	/// This defaults to the entire document. This is useful
+	/// for working with embedded languages.
+	public var includedRanges: [TSRange] {
+		get {
+			var count: UInt32 = 0
+			let tsRangePointer = ts_parser_included_ranges(internalParser, &count)
+
+			let tsRangeBuffer = UnsafeBufferPointer<tree_sitter.TSRange>(start: tsRangePointer, count: Int(count))
+
+			return tsRangeBuffer.map({ TSRange(internalRange: $0) })
+		}
+		set {
+			let ranges = newValue.map({ $0.internalRange })
+
+			ranges.withUnsafeBytes { bufferPtr in
+				let count = newValue.count
+
+				guard let ptr = bufferPtr.baseAddress?.bindMemory(to: tree_sitter.TSRange.self, capacity: count) else {
+					preconditionFailure("unable to convert pointer")
+				}
+
+				ts_parser_set_included_ranges(internalParser, ptr, UInt32(count))
+			}
+		}
+	}
+
+	/// The maximum time interval the parser can run before halting.
+	public var timeout: TimeInterval {
+		get {
+			let us = ts_parser_timeout_micros(internalParser)
+
+			return TimeInterval(us) / 1000.0 / 1000.0
+		}
+		set {
+			let us = UInt64(newValue * 1000.0 * 1000.0)
+
+			ts_parser_set_timeout_micros(internalParser, us)
+		}
+	}
 }
 
 extension Parser {

@@ -37,7 +37,12 @@ public enum QueryPredicateError: Error {
     case textContentUnavailable
 }
 
-public class Query {
+/// An object that represents a collection of tree-sitter query statements.
+///
+/// Typically, query definitions are stored in a `.scm` file.
+///
+/// Tree-sitter's official documentation: [Pattern Matching with Queries](https://tree-sitter.github.io/tree-sitter/using-parsers#pattern-matching-with-queries)
+public final class Query: Sendable {
     let internalQuery: OpaquePointer
     let predicateList: [[Predicate]]
 
@@ -57,7 +62,8 @@ public class Query {
             }
 
             return ts_query_new(language.tsLanguage,
-                                ptr, UInt32(dataLength),
+                                ptr,
+								UInt32(dataLength),
                                 &errorOffset,
                                 &queryError)
         }
@@ -86,6 +92,13 @@ public class Query {
         return Int(ts_query_string_count(internalQuery))
     }
 
+	/// Ru  a query
+	///
+	/// Note that both the node **and** the tree is is part of
+	/// must remain valid as long as the query is being used.
+	///
+	/// - Parameter node: the root node for the query
+	/// - Parameter tree: keep an optional reference to the tree
     public func execute(node: Node, in tree: Tree? = nil) -> QueryCursor {
         let cursor = QueryCursor()
 
@@ -130,22 +143,57 @@ public class Query {
 }
 
 public struct QueryCapture {
-    public var node: Node
-    public var index: Int
-    public var name: String?
+    public let node: Node
+    public let index: Int
+    public let nameComponents: [String]
+    public let patternIndex: Int
+	public let metadata: [String: String]
 
-    init?(tsCapture: TSQueryCapture, name: String?) {
+    init?(tsCapture: TSQueryCapture, name: String?, patternIndex: Int, metadata: [String: String]) {
         guard let node = Node(internalNode: tsCapture.node) else {
             return nil
         }
 
         self.node = node
         self.index = Int(tsCapture.index)
-        self.name = name
+        self.nameComponents = name?.components(separatedBy: ".") ?? []
+        self.patternIndex = patternIndex
+		self.metadata = metadata
     }
+
+	init?(tsCapture: TSQueryCapture, query: Query?, patternIndex: Int) {
+		let name = query?.captureName(for: Int(tsCapture.index))
+
+		let predicates = query?.predicates(for: patternIndex) ?? []
+
+		let metadata = name.map { QueryCapture.evaluateDirectives(predicates, with: $0) } ?? [:]
+
+		self.init(tsCapture: tsCapture, name: name, patternIndex: patternIndex, metadata: metadata)
+	}
+
+	private static func evaluateDirectives(_ predicates: [Predicate], with name: String) -> [String: String] {
+		let pairs = predicates.compactMap { predicate -> (String, String)? in
+			switch predicate {
+			case let .set(captureName: captureName, key: key, value: value):
+				if captureName == name {
+					return (key, value)
+				}
+			default:
+				break
+			}
+
+			return nil
+		}
+
+		return Dictionary(pairs, uniquingKeysWith: { $1 })
+	}
 
     public var range: NSRange {
         return node.range
+    }
+
+    public var name: String? {
+        return nameComponents.joined(separator: ".")
     }
 }
 
@@ -157,17 +205,36 @@ extension QueryCapture: CustomDebugStringConvertible {
     }
 }
 
+extension QueryCapture: Comparable {
+    public static func < (lhs: QueryCapture, rhs: QueryCapture) -> Bool {
+        if lhs.range.lowerBound != rhs.range.lowerBound {
+            return lhs.range.lowerBound < rhs.range.lowerBound
+        }
+
+        if lhs.nameComponents.count != rhs.nameComponents.count {
+            return lhs.nameComponents.count < rhs.nameComponents.count
+        }
+
+        return lhs.patternIndex < rhs.patternIndex
+    }
+}
+
 public struct QueryMatch {
     public var id: Int
     public var patternIndex: Int
     public var captures: [QueryCapture]
     public let predicates: [Predicate]
+	public let metadata: [String: String]
 
     public func captures(named name: String) -> [QueryCapture] {
         return captures.filter({ $0.name == name })
     }
 }
 
+/// A tree-sitter TSQueryCursor wrapper
+///
+/// This class is pretty faithful to to C API. However,
+/// it does evaluate `#set!` directives.
 public class QueryCursor {
     let internalCursor: OpaquePointer
     public private(set) var activeQuery: Query?
@@ -186,8 +253,8 @@ public class QueryCursor {
     /// Note that the node **and** the Tree is is part of
     /// must remain valid as long as the query is being used.
     ///
-    /// - Parameter query: they query object to execute
-    /// - Parameter node: they query object to execute
+    /// - Parameter query: the query object to execute
+    /// - Parameter node: the root node for the query
     /// - Parameter tree: keep an optional reference to the tree
     public func execute(query: Query, node: Node, in tree: Tree? = nil) {
         self.activeQuery = query
@@ -220,31 +287,9 @@ public class QueryCursor {
         ts_query_cursor_set_point_range(internalCursor, start, end)
     }
 
-    func makeCapture(from capture: TSQueryCapture) -> QueryCapture? {
-        let name = activeQuery?.captureName(for: Int(capture.index))
-
-        return QueryCapture(tsCapture: capture, name: name)
-    }
-
+    @available(*, deprecated, renamed: "next")
     public func nextMatch() -> QueryMatch? {
-        var match = TSQueryMatch(id: 0, pattern_index: 0, capture_count: 0, captures: nil)
-
-        if ts_query_cursor_next_match(internalCursor, &match) == false {
-            return nil
-        }
-
-        let captureBuffer = UnsafeBufferPointer<TSQueryCapture>(start: match.captures,
-                                                                count: Int(match.capture_count))
-
-        let patternIndex = Int(match.pattern_index)
-        let predicates = activeQuery?.predicates(for: patternIndex) ?? []
-
-        let captures = captureBuffer.compactMap({ makeCapture(from: $0) })
-
-        return QueryMatch(id: Int(match.id),
-                          patternIndex: Int(match.pattern_index),
-                          captures: captures,
-                          predicates: predicates)
+        return next()
     }
 
     public func nextCapture() -> QueryCapture? {
@@ -260,6 +305,46 @@ public class QueryCursor {
 
         let capture = captureBuffer[Int(index)]
 
-        return makeCapture(from: capture)
+		return QueryCapture(tsCapture: capture, query: activeQuery, patternIndex: Int(match.pattern_index))
+    }
+}
+
+extension QueryCursor: Sequence, IteratorProtocol {
+	private func evaluateDirectives(_ predicates: [Predicate]) -> [String: String] {
+		let pairs = predicates.compactMap { predicate -> (String, String)? in
+			switch predicate {
+			case .set(captureName: nil, key: let key, value: let value):
+				return (key, value)
+			default:
+				return nil
+			}
+		}
+
+		return Dictionary(pairs, uniquingKeysWith: { $1 })
+	}
+
+    public func next() -> QueryMatch? {
+        var match = TSQueryMatch(id: 0, pattern_index: 0, capture_count: 0, captures: nil)
+
+        if ts_query_cursor_next_match(internalCursor, &match) == false {
+            return nil
+        }
+
+        let captureBuffer = UnsafeBufferPointer<TSQueryCapture>(start: match.captures,
+                                                                count: Int(match.capture_count))
+
+        let patternIndex = Int(match.pattern_index)
+        let predicates = activeQuery?.predicates(for: patternIndex) ?? []
+		let metadata = evaluateDirectives(predicates)
+
+		let captures = captureBuffer.compactMap({
+			return QueryCapture(tsCapture: $0, query: activeQuery, patternIndex: patternIndex)
+		})
+
+        return QueryMatch(id: Int(match.id),
+                          patternIndex: Int(match.pattern_index),
+                          captures: captures,
+                          predicates: predicates,
+						  metadata: metadata)
     }
 }

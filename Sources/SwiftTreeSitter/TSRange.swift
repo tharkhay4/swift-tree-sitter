@@ -1,7 +1,7 @@
 import Foundation
 import tree_sitter
 
-public struct TSRange {
+public struct TSRange: Codable, Hashable, Sendable {
     public let points: Range<Point>
     public let bytes: Range<UInt32>
 
@@ -24,9 +24,13 @@ public struct TSRange {
 
         self.points = start..<safeEnd
     }
-}
 
-extension TSRange: Equatable {
+	var internalRange: tree_sitter.TSRange {
+		return .init(start_point: points.lowerBound.internalPoint,
+					 end_point: points.upperBound.internalPoint,
+					 start_byte: bytes.lowerBound,
+					 end_byte: bytes.upperBound)
+	}
 }
 
 extension TSRange: Comparable {
@@ -34,3 +38,4 @@ extension TSRange: Comparable {
         return lhs.points.lowerBound < rhs.points.lowerBound
     }
 }
+
